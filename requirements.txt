@@ -1,0 +1,17 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+motor==3.3.2  # Async MongoDB driver
+pymongo==4.6.2  # Pinned for motor 3.3.2 compatibility
+beanie==1.24.0  # MongoDB ODM built on Motor and Pydantic
+pydantic[email]==2.10.3
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+argon2-cffi==23.1.0
+email-validator==2.1.0
+dnspython==2.6.1
+slowapi==0.1.9
+PyJWT==2.8.0
+cryptography==42.0.0
+redis==5.0.1  # Redis for MFA sessions and OTP storage
+pyotp==2.9.0  # TOTP for MFA
+ua-parser==0.18.0  # User agent parsing for device detection

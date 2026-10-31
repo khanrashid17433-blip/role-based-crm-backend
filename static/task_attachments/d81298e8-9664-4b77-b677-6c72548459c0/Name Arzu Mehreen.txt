@@ -1,0 +1,509 @@
+import os
+import traceback
+import requests
+from io import BytesIO
+from bson import ObjectId
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+from fastapi import HTTPException
+
+# Base directory for static files (london_lms folder)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def generate_marksheet_id(db, issued_date=None):
+    if issued_date is None:
+        issued_date = datetime.utcnow()
+    elif isinstance(issued_date, str):
+        try:
+            issued_date = datetime.fromisoformat(issued_date.replace('Z', '+00:00'))
+        except:
+            issued_date = datetime.utcnow()
+    
+    # Format: YYYYMMDD
+    date_str = issued_date.strftime("%Y%m%d")
+    
+    # Find the highest counter for this date
+    prefix_pattern = f"MARK{date_str}-"
+    
+    # Find all marksheets with this date prefix
+    existing_marksheets = db.branch_marksheets.find({
+        "marksheet_number": {"$regex": f"^{prefix_pattern}"}
+    }).sort("marksheet_number", -1).limit(1)
+    
+    # Get the next counter
+    counter = 1
+    for marksheet in existing_marksheets:
+        marksheet_num = marksheet.get("marksheet_number", "")
+        if marksheet_num:
+            try:
+                # Extract the counter part (last 4 digits)
+                last_part = marksheet_num.split("-")[-1]
+                counter = int(last_part) + 1
+            except:
+                counter = 1
+        break
+    
+    # Format the marksheet ID
+    marksheet_id = f"MARK{date_str}-{counter:04d}"
+    
+    return marksheet_id
+async def generate_marksheet_image(marksheet_data: dict, output_path: str) -> bool:
+    """
+    Generate marksheet image using template with student data
+    Template Size: 586 x 827 (NURCLM Format)
+    
+    COORDINATE SYSTEM:
+    LEFT  = x -
+    RIGHT = x +
+    UP    = y -
+    DOWN  = y +
+    """
+
+    try:
+        # ---------------------------------------
+        # LOAD TEMPLATE
+        # ---------------------------------------
+        # ---------------------------------------
+        # LOAD TEMPLATE
+        # ---------------------------------------
+        # Check if a custom template path is provided in the data
+        custom_template_path = marksheet_data.get("template_path")
+        
+        if custom_template_path:
+            # Clean up the path (remove leading slashes or excessive dots)
+            clean_path = custom_template_path.replace("\\", "/").strip("/")
+            
+            # Remove 'london_lms/' prefix if present, as BASE_DIR usually points to project root
+            if clean_path.startswith("london_lms/"):
+                clean_path = clean_path.replace("london_lms/", "", 1)
+                
+            template_path = os.path.join(BASE_DIR, clean_path)
+            print(f"[MARKSHEET] Using custom template path: {template_path}")
+        else:
+            # Fallback to default if no path provided
+            template_path = os.path.join(
+                BASE_DIR, "uploads", "Marksheet", "marksheet.jpeg"
+            )
+        
+        print(f"[MARKSHEET] Template path: {template_path}")
+        print(f"[MARKSHEET] Input data: {marksheet_data}")
+
+        if not os.path.exists(template_path):
+            raise FileNotFoundError("Marksheet template not found")
+
+        img = Image.open(template_path).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        width, height = img.size
+        print(f"[MARKSHEET] Template size: {width}x{height}")
+
+        # ---------------------------------------
+        # FONTS
+        # ---------------------------------------
+        try:
+            # Try Linux font paths first, then Windows as fallback
+            linux_fonts = [
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ]
+            linux_bold_fonts = [
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            ]
+            
+            font_path = None
+            font_bold_path = None
+            
+            # Find available regular font
+            for path in linux_fonts:
+                if os.path.exists(path):
+                    font_path = path
+                    break
+            
+            # Find available bold font
+            for path in linux_bold_fonts:
+                if os.path.exists(path):
+                    font_bold_path = path
+                    break
+            
+            # Fallback to Windows paths if Linux fonts not found
+            if not font_path:
+                font_path = "C:/Windows/Fonts/arial.ttf"
+            if not font_bold_path:
+                font_bold_path = "C:/Windows/Fonts/arialbd.ttf"
+            
+            font_large = ImageFont.truetype(font_bold_path, 20)
+            font_medium = ImageFont.truetype(font_path, 16)
+            font_small = ImageFont.truetype(font_path, 14)
+            font_tiny = ImageFont.truetype(font_path, 8)
+            font_table = ImageFont.truetype(font_path, 13)
+            print(f"[MARKSHEET] Using fonts - Regular: {font_path}, Bold: {font_bold_path}")
+        except Exception as font_err:
+            print(f"[MARKSHEET] Font loading error: {font_err}, using default fonts")
+            font_large = font_medium = font_small = font_tiny = font_table = ImageFont.load_default()
+
+        text_color = (51, 48, 145) # Blue text
+        black_color = (0, 0, 0)  # Black text for Sr. No.
+        white = (255, 255, 255)  # White text for blue cells
+
+        # ---------------------------------------
+        # DATA EXTRACTION
+        # ---------------------------------------
+        student_name = str(marksheet_data.get("student_name") or "")
+        father_name = str(marksheet_data.get("father_name") or "")
+        mother_name = str(marksheet_data.get("mother_name") or "")
+        course_name = str(marksheet_data.get("course_name") or "")
+        course_code = str(marksheet_data.get("course_code") or "")
+        # Extract only first 4 letters of course code for display
+        course_code_display = course_code[:4] if len(course_code) >= 4 else course_code
+        atc_name = str(marksheet_data.get("atc_name") or "")
+        atc_address = str(marksheet_data.get("atc_address") or "")
+
+        reg_number = str(marksheet_data.get("student_registration") or "")
+        # Extract only the last part (simple ID) without franchise code
+        student_display_id = reg_number.split('_')[-1] if '_' in reg_number else reg_number
+        sr_number = str(marksheet_data.get("sr_number") or "")
+        
+        join_date = str(marksheet_data.get("join_date") or "")
+        issue_date = str(marksheet_data.get("issue_date") or "")
+        
+        # Format dates to DD-MM-YYYY if they are in ISO format (YYYY-MM-DD)
+        def format_date(date_str):
+            if not date_str:
+                return ""
+            try:
+                # Try to parse ISO format (YYYY-MM-DD)
+                if "-" in date_str and len(date_str) == 10:
+                    parts = date_str.split("-")
+                    if len(parts) == 3 and len(parts[0]) == 4:
+                        # Convert YYYY-MM-DD to DD-MM-YYYY
+                        return f"{parts[2]}-{parts[1]}-{parts[0]}"
+                return date_str
+            except:
+                return date_str
+        
+        join_date = format_date(join_date)
+        issue_date = format_date(issue_date)
+
+        # Results data
+        subjects = marksheet_data.get("subjects_results", [])
+        total_marks = marksheet_data.get("total_marks", 0)
+        obtained_marks = marksheet_data.get("obtained_marks", 0)
+        percentage = marksheet_data.get("percentage", 0)
+        grade = str(marksheet_data.get("grade") or "")
+
+        print(f"[MARKSHEET] Student: {student_name}, Father: {father_name}, Course: {course_name}")
+        print(f"[MARKSHEET] Subjects count: {len(subjects)}")
+
+        # ---------------------------------------
+        # HEADER SECTION (Top bar)
+        # Sr. No.: (left top)
+        # ---------------------------------------
+        # Sr. No. - position after "Sr. No.:" label (top left) - keep black
+        draw.text((80, 45), sr_number, fill=black_color, font=font_tiny)
+       
+        # ---------------------------------------
+        # STUDENT DETAILS SECTION (Middle section with form fields)
+        # These positions are after the field labels (colon position)
+        # ---------------------------------------
+        # Name of Student: (row 1)
+        draw.text((140, 295), student_name.upper(), fill=text_color, font=font_tiny)
+        
+        # Father's Name: (row 2)
+        draw.text((140, 315), father_name.upper(), fill=text_color, font=font_tiny)
+        
+        # Mother's Name: (row 3)
+        draw.text((140, 335), mother_name.upper(), fill=text_color, font=font_tiny)
+        
+        # ATC: (row 4) - Authorized Training Centre
+        draw.text((140, 360), atc_name.upper(), fill=text_color, font=font_tiny)
+        
+        # Course: (row 5)
+        draw.text((140, 380), course_name.upper(), fill=text_color, font=font_tiny)
+
+        data_row_y = 415
+
+        # Helper: try reducing font size so text fits in available width; if still too long, truncate with ellipsis.
+        def fit_text(draw_ctx, text, base_font_path, start_size, max_width, min_size=8):
+            if not text:
+                return (font_small, text)
+            # Try TrueType font resizing when possible
+            try:
+                f = None
+                for size in range(start_size, min_size - 1, -1):
+                    try:
+                        f = ImageFont.truetype(base_font_path, size)
+                    except Exception:
+                        f = None
+                        break
+                    bbox = draw_ctx.textbbox((0, 0), text, font=f)
+                    if bbox[2] <= max_width:
+                        return (f, text)
+                # If no size fits, truncate using the smallest font we could create (or fallback font)
+                if f is None:
+                    raise Exception("truetype not available")
+                ell = "..."
+                for l in range(len(text), 0, -1):
+                    t = text[:l] + ell
+                    try:
+                        bbox = draw_ctx.textbbox((0, 0), t, font=f)
+                        if bbox[2] <= max_width:
+                            return (f, t)
+                    except Exception:
+                        continue
+                return (f, text[:1] + ell)
+            except Exception:
+                # Fallback: use existing small font and truncate if necessary
+                try:
+                    bbox = draw_ctx.textbbox((0, 0), text, font=font_small)
+                    if bbox[2] <= max_width:
+                        return (font_small, text)
+                except Exception:
+                    pass
+                ell = "..."
+                for l in range(len(text), 0, -1):
+                    t = text[:l] + ell
+                    try:
+                        bbox = draw_ctx.textbbox((0, 0), t, font=font_small)
+                        if bbox[2] <= max_width:
+                            return (font_small, t)
+                    except Exception:
+                        continue
+                return (font_small, text[:1] + ell)
+
+        # Blue bar with Course Code, Student ID, Join Date, Date of Issue
+        # Use normal font (not bold) for clean appearance
+        blue_bar_font = ImageFont.truetype(font_path, 7)
+        # Course Code - first column (centered) - only 4 letters
+        draw.text((155, data_row_y), course_code_display, fill=text_color, font=blue_bar_font)
+        # Student ID/Reg Number - second column (centered) - simple ID without franchise code
+        draw.text((240, data_row_y), student_display_id, fill=text_color, font=blue_bar_font)
+        # Join Date - third column (centered)
+        draw.text((310, data_row_y), join_date, fill=text_color, font=blue_bar_font)
+        # Date of Issue - fourth column (centered)
+        draw.text((385, data_row_y), issue_date, fill=text_color, font=blue_bar_font)
+        
+        print(f"[MARKSHEET] Blue bar data at y={data_row_y} - Course: {course_code_display}, RegNo: {student_display_id}, Join: {join_date}, Issue: {issue_date}")
+
+        # Subjects table
+        start_y = 500
+        row_gap = 10
+
+        total_theory_obt = 0
+        total_theory_max = 0
+        total_practical_obt = 0
+        total_practical_max = 0
+
+        for i, sub in enumerate(subjects[:5]):  # Max 5 subjects (template shows space for ~5)
+            y = start_y + i * row_gap
+
+            subject_name = str(sub.get("subject_name") or "")
+            theory_obt = float(sub.get("theory_marks", 0))
+            theory_max = float(sub.get("theory_max", 100))
+            practical_obt = float(sub.get("practical_marks", 0))
+            practical_max = float(sub.get("practical_max", 100))
+
+            total_theory_obt += theory_obt
+            total_theory_max += theory_max
+            total_practical_obt += practical_obt
+            total_practical_max += practical_max
+
+            if subject_name:
+                # Subject Name column (left side)
+                draw.text((75, y), subject_name, fill=text_color, font=font_tiny)
+                # Marks table on right side (obtained marks only - no subject total)
+                # Theory Obtained (white text)
+                draw.text((420, y), f"{int(theory_obt)}", fill=white, font=font_tiny)
+                # Practical Obtained (white text)
+                draw.text((480, y), f"{int(practical_obt)}", fill=white, font=font_tiny)
+
+        # Summary boxes at bottom (Grade, Percentage, Total Marks Obtained, Total Max Marks)
+        summary_y = 618
+        
+        # Grade (first box)
+        draw.text((92, summary_y), grade, fill=text_color, font=font_tiny)
+        # Percentage (second box)  
+        draw.text((170, summary_y), f"{percentage:.1f}%" if isinstance(percentage, (int, float)) else str(percentage), fill=text_color, font=font_tiny)
+        # Total Marks Obtained (third box)
+        draw.text((260, summary_y), f"{obtained_marks:.0f}" if isinstance(obtained_marks, (int, float)) else str(obtained_marks), fill=text_color, font=font_tiny)
+        # Total Max Marks (fourth box)
+        draw.text((340, summary_y), f"{total_marks:.0f}" if isinstance(total_marks, (int, float)) else str(total_marks), fill=text_color, font=font_tiny)
+
+        # ---------------------------------------
+        # STUDENT PHOTO (Right side of student details)
+        # Position: QR code / photo area on right side
+        # ---------------------------------------
+        photo_url = marksheet_data.get("photo_url") or ""
+        student_id = marksheet_data.get("student_id") or ""
+        print(f"[MARKSHEET] Photo URL received: {photo_url}")
+        print(f"[MARKSHEET] Student ID for photo search: {student_id}")
+
+        # If no photo_url provided, try to find photo by student_id
+        if not photo_url and student_id:
+            import glob
+            student_photos_dir = os.path.join(BASE_DIR, "uploads", "student_photos")
+            print(f"[MARKSHEET] No photo_url, searching in: {student_photos_dir}")
+            if os.path.exists(student_photos_dir):
+                # Try multiple patterns
+                patterns = [
+                    os.path.join(student_photos_dir, f"student_{student_id}_*.jpg"),
+                    os.path.join(student_photos_dir, f"student_{student_id}_*.png"),
+                    os.path.join(student_photos_dir, f"{student_id}_*.jpg"),
+                    os.path.join(student_photos_dir, f"{student_id}_*.png"),
+                ]
+                
+                matching_photos = []
+                for pattern in patterns:
+                    matching_photos.extend(glob.glob(pattern))
+                
+                print(f"[MARKSHEET] Found {len(matching_photos)} photos for student {student_id}")
+                
+                if matching_photos:
+                    # Sort by modification time and get the latest
+                    matching_photos.sort(key=os.path.getmtime, reverse=True)
+                    photo_url = matching_photos[0]
+                    print(f"[MARKSHEET] Using latest photo: {photo_url}")
+
+        if photo_url and photo_url.strip():
+            try:
+                photo = None
+                
+                # Check if it's a URL (http/https)
+                if photo_url.startswith('http'):
+                    print(f"[MARKSHEET] Loading photo from URL: {photo_url}")
+                    # Remove query params for logging but keep for request
+                    clean_url = photo_url.split('?')[0] if '?' in photo_url else photo_url
+                    print(f"[MARKSHEET] Clean URL: {clean_url}")
+                    response = requests.get(photo_url, timeout=10)
+                    if response.status_code == 200:
+                        photo = Image.open(BytesIO(response.content))
+                        print(f"[MARKSHEET] Photo loaded from HTTP URL successfully")
+                    else:
+                        print(f"[MARKSHEET] HTTP request failed with status: {response.status_code}")
+                else:
+                    # Local file - Server runs from Backend folder
+                    # photo_url could be: /uploads/student_photos/xxx.jpg
+                    
+                    # Get current working directory
+                    cwd = os.getcwd()
+                    print(f"[MARKSHEET] Current working directory: {cwd}")
+                    print(f"[MARKSHEET] BASE_DIR: {BASE_DIR}")
+                    
+                    # Strip leading slash and normalize
+                    clean_photo_path = photo_url.lstrip("/").replace("\\", "/")
+                    filename = os.path.basename(clean_photo_path)
+                    
+                    # Build possible paths
+                    possible_paths = [
+                        # If it's already an absolute path, use it directly
+                        photo_url if os.path.isabs(photo_url) else None,
+                        # Direct path from cwd
+                        os.path.join(cwd, clean_photo_path),
+                        # Using BASE_DIR
+                        os.path.join(BASE_DIR, clean_photo_path),
+                        # Just the clean path
+                        clean_photo_path,
+                        # uploads/student_photos folder directly
+                        os.path.join(cwd, "uploads", "student_photos", filename),
+                        os.path.join(BASE_DIR, "uploads", "student_photos", filename),
+                        # Try without uploads prefix
+                        os.path.join(cwd, "uploads", clean_photo_path.replace("uploads/", "")),
+                        os.path.join(BASE_DIR, "uploads", clean_photo_path.replace("uploads/", "")),
+                    ]
+                    
+                    # Remove None values
+                    possible_paths = [p for p in possible_paths if p]
+                    
+                    for path in possible_paths:
+                        print(f"[MARKSHEET] Trying photo path: {path}")
+                        if os.path.exists(path):
+                            print(f"[MARKSHEET] ✅ Photo FOUND at: {path}")
+                            photo = Image.open(path)
+                            break
+                        else:
+                            print(f"[MARKSHEET] ❌ Path not found: {path}")
+                
+                if photo:
+                    photo = photo.convert("RGB")
+                    # Photo size for student photo area (small passport size)
+                    photo = photo.resize((85, 90), Image.Resampling.LANCZOS)
+                    # Position: right side near the course/QR code area
+                    img.paste(photo, (455, 280))
+                    print(f"[MARKSHEET] Student photo added successfully at (460, 280)")
+                else:
+                    print(f"[MARKSHEET] Photo file not found for any path")
+                    
+            except Exception as photo_err:
+                print(f"[MARKSHEET] Error loading photo: {photo_err}")
+        else:
+            print(f"[MARKSHEET] No photo URL provided")
+
+        # ---------------------------------------
+        # SAVE GENERATED MARKSHEET
+        # ---------------------------------------
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        img.save(output_path, "PNG", quality=100)
+
+        return True
+
+    except Exception as e:
+        print(f"Error generating marksheet: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate marksheet image: {str(e)}"
+        )
+
+def issue_marksheet(db, payload):
+    """
+    Issue a new marksheet with unique marksheet number
+    """
+    issued_date = payload.get("issued_on") or datetime.utcnow().isoformat()
+    
+    # Generate unique marksheet number
+    marksheet_number = generate_marksheet_id(db, issued_date)
+    
+    marksheet_doc = {
+        "student_id": payload.get("student_id"),
+        "course_id": payload.get("course_id"),
+        "semester": payload.get("semester"),
+        "session_year": payload.get("session_year"),
+        "subjects_results": payload.get("subjects_results", []),
+        "total_marks": payload.get("total_marks"),
+        "obtained_marks": payload.get("obtained_marks"),
+        "percentage": payload.get("percentage"),
+        "grade": payload.get("grade"),
+        "result": payload.get("result"),
+        "issued_on": issued_date,
+        "verified": False,
+        "marksheet_number": marksheet_number,
+        "status": "issued"
+    }
+    
+    result = db.branch_marksheets.insert_one(marksheet_doc)
+    return {
+        "success": True, 
+        "marksheet_id": str(result.inserted_id),
+        "marksheet_number": marksheet_number
+    }
+
+def list_marksheets(db, student_id):
+    """
+    List all marksheets for a student
+    """
+    return list(db.branch_marksheets.find({"student_id": student_id}))
+
+def verify_marksheet(db, marksheet_id, payload):
+    """
+    Verify a marksheet
+    """
+    result = db.branch_marksheets.update_one(
+        {"_id": ObjectId(marksheet_id)},
+        {"$set": {"verified": True, **payload}}
+    )
+    return {"verified": result.modified_count > 0}
+
+def get_marksheet_by_number(db, marksheet_number):
+    """
+    Get marksheet by marksheet number for verification
+    """
+    return db.branch_marksheets.find_one({"marksheet_number": marksheet_number})

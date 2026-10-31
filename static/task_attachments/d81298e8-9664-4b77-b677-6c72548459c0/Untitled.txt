@@ -1,0 +1,638 @@
+
+import os
+import io
+import base64
+from bson import ObjectId
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+from fastapi import HTTPException, BackgroundTasks
+from app.models.certificate import get_certificate_collection
+
+# Base directory for static files
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FONT_PATH = os.path.join(BASE_DIR, "fonts", "Roboto-Regular.ttf")
+TEMPLATE_DIR = os.path.join(BASE_DIR, "..", "uploads", "Certificate")
+GENERATED_DIR = os.path.join(BASE_DIR, "..", "uploads", "Certificate", "generated")
+
+# Ensure generated directory exists
+os.makedirs(GENERATED_DIR, exist_ok=True)
+
+
+def generate_certificate_id(db, issued_date=None):
+    if issued_date is None:
+        issued_date = datetime.utcnow()
+    elif isinstance(issued_date, str):
+        try:
+            issued_date = datetime.fromisoformat(issued_date.replace('Z', '+00:00'))
+        except:
+            issued_date = datetime.utcnow()
+    
+    # Format: YYYYMMDD
+    date_str = issued_date.strftime("%Y%m%d")
+    
+    # Find the highest counter for this date
+    cert_collection = get_certificate_collection(db)
+    prefix_pattern = f"CERT{date_str}-"
+    
+    # Find all certificates with this date prefix
+    existing_certs = cert_collection.find({
+        "certificate_number": {"$regex": f"^{prefix_pattern}"}
+    }).sort("certificate_number", -1).limit(1)
+    
+    # Get the next counter
+    counter = 1
+    for cert in existing_certs:
+        cert_num = cert.get("certificate_number", "")
+        if cert_num:
+            try:
+                # Extract the counter part (last 4 digits)
+                last_part = cert_num.split("-")[-1]
+                counter = int(last_part) + 1
+            except:
+                counter = 1
+        break
+    
+    # Format the certificate ID
+    certificate_id = f"CERT{date_str}-{counter:04d}"
+    
+    return certificate_id
+
+
+def issue_certificate(db, payload):
+    """Issue a certificate and store in database"""
+    issued_date = payload.issued_on or datetime.utcnow().isoformat()
+    
+    # Generate unique certificate ID
+    certificate_number = generate_certificate_id(db, issued_date)
+    
+    cert_doc = {
+        "student_id": payload.student_id,
+        "quiz_id": payload.quiz_id,
+        "score": payload.score,
+        "passed": payload.passed,
+        "issued_on": issued_date,
+        "verified": False,
+        "certificate_number": certificate_number
+    }
+    result = get_certificate_collection(db).insert_one(cert_doc)
+    return {
+        "success": True, 
+        "certificate_id": str(result.inserted_id),
+        "certificate_number": certificate_number
+    }
+
+
+def list_certificates(db, student_id):
+    """List all certificates for a student"""
+    return list(get_certificate_collection(db).find({"student_id": student_id}))
+
+
+def verify_certificate(db, certificate_id, payload):
+    """Verify a certificate"""
+    result = get_certificate_collection(db).update_one(
+        {"_id": ObjectId(certificate_id)},
+        {"$set": payload.dict(exclude_unset=True)}
+    )
+    return {"verified": result.modified_count > 0}
+
+
+async def generate_certificate_image(cert_data: dict, output_path: str) -> bool:
+   
+    try:
+        # Generate unique session ID first
+        current_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        unique_session_id = str(hash(current_timestamp))[-6:]
+        
+        print(f"🚀 [Session:{unique_session_id}] STARTING CERTIFICATE GENERATION for: {cert_data.get('student_name', 'Student')}")
+        # FORCE DELETE existing output file if it exists to ensure fresh generation
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+                print(f"🗑️ [Session:{unique_session_id}] DELETED EXISTING CERTIFICATE FILE: {output_path}")
+            except Exception as e:
+                print(f"⚠️ [Session:{unique_session_id}] Failed to delete existing file: {e}")
+        
+        # Get absolute path to london_lms directory
+        current_file = os.path.abspath(__file__)  # certificate_service.py
+        services_dir = os.path.dirname(current_file)  # app/services
+        app_dir = os.path.dirname(services_dir)  # app
+        london_lms_dir = os.path.dirname(app_dir)  # london_lms
+        
+        print(f"🔍 [Session:{unique_session_id}] London LMS directory: {london_lms_dir}")
+        
+        # ALWAYS USE ORIGINAL TEMPLATE - IGNORE ANY TEMPLATE PATH FROM CERT_DATA
+        # This prevents using previously generated certificates as templates
+        if 'template_path' in cert_data:
+            print(f"⚠️ [Session:{unique_session_id}] IGNORING template_path from cert_data: {cert_data.get('template_path')}")
+            cert_data.pop('template_path', None)  # Remove template_path if it exists
+        
+        # FIXED TEMPLATE PATH - ALWAYS USE ORIGINAL
+        template_paths = [
+            os.path.join(london_lms_dir, "uploads", "Certificate", "certificate.png"),
+            os.path.join(london_lms_dir, "uploads", "Certificate", "certificate.jpg"),
+            os.path.join(london_lms_dir, "uploads", "Certificate", "certificate.jpeg"),
+            os.path.join(london_lms_dir, "uploads", "certificates", "certificate.png"),
+            os.path.join(london_lms_dir, "uploads", "certificates", "template.png")
+        ]
+        
+        template_path = None
+        for path in template_paths:
+            if os.path.exists(path):
+                template_path = path
+                print(f"✅ [Session:{unique_session_id}] Found template at: {template_path}")
+                break
+        
+        if not template_path:
+            # List available files for debugging
+            cert_dir = os.path.join(london_lms_dir, "uploads", "Certificate")
+            print(f"📁 [Session:{unique_session_id}] Checking certificate directory: {cert_dir}")
+            if os.path.exists(cert_dir):
+                available_files = os.listdir(cert_dir)
+                print(f"📁 [Session:{unique_session_id}] Available files in Certificate directory: {available_files}")
+            else:
+                print(f"📁 [Session:{unique_session_id}] Certificate directory does not exist: {cert_dir}")
+                # Try to create the directory and check parent
+                parent_dir = os.path.join(london_lms_dir, "uploads")
+                if os.path.exists(parent_dir):
+                    uploads_contents = os.listdir(parent_dir)
+                    print(f"📁 [Session:{unique_session_id}] Parent uploads directory contents: {uploads_contents}")
+                else:
+                    print(f"📁 [Session:{unique_session_id}] Parent uploads directory does not exist: {parent_dir}")
+            
+            raise FileNotFoundError(f"Certificate template not found. Searched paths: {template_paths}")
+
+       
+        # FORCE LOAD ACTUAL TEMPLATE - NO FALLBACKS!
+        try:
+            if not template_path:
+                raise FileNotFoundError(f"Certificate template not found. Searched paths: {template_paths}")
+            
+            print(f"🔄 [Session:{unique_session_id}] READING FRESH TEMPLATE FROM: {template_path}")
+            
+            # Verify file exists and is readable
+            if not os.path.exists(template_path):
+                raise FileNotFoundError(f"Template file does not exist: {template_path}")
+            
+            if not os.access(template_path, os.R_OK):
+                raise PermissionError(f"Template file is not readable: {template_path}")
+            
+            # Get file size to ensure it's not empty
+            file_size = os.path.getsize(template_path)
+            if file_size == 0:
+                raise ValueError(f"Template file is empty: {template_path}")
+            
+            print(f"📁 Template file verified: {file_size} bytes")
+            
+            # Open file and read bytes directly to avoid PIL caching
+            with open(template_path, 'rb') as template_file:
+                template_bytes = template_file.read()
+            
+            print(f"📖 Template bytes read: {len(template_bytes)} bytes")
+            
+            # Create PIL Image from bytes to ensure fresh load
+            template_img = Image.open(io.BytesIO(template_bytes)).convert("RGB")
+            img = template_img.copy()  # Create a fresh copy for each certificate
+            
+            print(f"🖼️ Template image loaded: {img.size}")
+            
+            # Close the original template to ensure it's not cached
+            template_img.close()
+            del template_img  # Explicitly delete reference
+            del template_bytes  # Free memory
+            
+        except Exception as template_error:
+            print(f"❌ [Session:{unique_session_id}] TEMPLATE LOADING FAILED: {template_error}")
+            print(f"❌ Template path attempted: {template_path}")
+            print(f"❌ Current working directory: {os.getcwd()}")
+            print(f"❌ Template exists check: {os.path.exists(template_path) if template_path else 'No path'}")
+            raise HTTPException(status_code=500, detail=f"Certificate template loading failed: {str(template_error)}")
+        
+        width, height = img.size
+        print(f"✅ [Session:{unique_session_id}] FRESH CLEAN TEMPLATE READY: {width}x{height}")
+        
+        draw = ImageDraw.Draw(img)
+        
+        # ======================================
+        # FONT SETUP
+        # ======================================
+        try:
+            font_paths = [
+                FONT_PATH,
+                "app/fonts/Roboto-Regular.ttf",
+                "arial.ttf",
+                "C:/Windows/Fonts/arial.ttf",
+            ]
+            
+            font_path = None
+            for fp in font_paths:
+                if os.path.exists(fp):
+                    font_path = fp
+                    break
+            
+            if not font_path:
+                font_path = "arial.ttf"
+                
+            font_name_large = ImageFont.truetype(font_path, 28)
+            font_name_medium = ImageFont.truetype(font_path, 22)
+            font_regular = ImageFont.truetype(font_path, 18)
+            font_small = ImageFont.truetype(font_path, 14)
+            font_tiny = ImageFont.truetype(font_path, 12)
+            print("TrueType fonts loaded successfully")
+        except Exception as e:
+            print(f"Font loading error: {e}, using default fonts")
+            font_name_large = ImageFont.load_default()
+            font_name_medium = ImageFont.load_default()
+            font_regular = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+            font_tiny = ImageFont.load_default()
+        
+        # ======================================
+        # TEXT COLORS
+        # ======================================
+        text_color = (11, 57, 92)  # #0B395C - Dark blue
+        red_color = (200, 0, 0)
+        blue_color = (0, 51, 153)
+        
+        # Helper functions
+        def fit_text_to_width(text, font, max_width, draw_obj):
+            bbox = draw_obj.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            if text_width <= max_width:
+                return font
+            scale = max_width / text_width
+            new_size = int(font.size * scale * 0.95)
+            if new_size < 10:
+                new_size = 10
+            try:
+                return ImageFont.truetype(font.path, new_size)
+            except:
+                return font
+        
+        def get_centered_x(text, font, start_x, end_x):
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            return start_x + ((end_x - start_x - text_width) // 2)
+        
+        print("Adding dynamic text overlays...")
+        
+        # ======================================
+        # DYNAMIC FIELDS
+        # ======================================
+        
+        # Sr. No.
+        sr_number = cert_data.get('sr_number', f"00{datetime.now().strftime('%Y%m%d')[-5:]}")
+
+        sr_x = int(width * 0.10)
+        sr_y = int(height * 0.075)   # pehle 0.060 tha → neeche aayega
+
+        # Add "SR NO." text before the actual sr_number
+        sr_text_with_label = f"SR NO. {sr_number}"
+        draw.text((sr_x, sr_y), sr_text_with_label, fill=(0, 0, 0), font=font_small)
+
+        
+        # ATC Code - Adjusted position for better visibility and full display
+        atc_code = cert_data.get('atc_code', cert_data.get('branch_code', 'SKILLWALLAH001'))
+
+        atc_x = int(width * 0.115)+80 # pehle 0.0115 tha
+        atc_y = int(height * 0.37)
+
+        draw.text((atc_x, atc_y), atc_code, fill=text_color, font=font_small)
+
+        
+        # Center Name & Address
+        center_name = cert_data.get('center_name', cert_data.get('branch_name', 'Training Centre'))
+        center_address = cert_data.get('center_address', '')
+
+        # Center box (base area)
+        center_box_start_x = int(width * 0.40)
+        center_box_end_x = int(width * 0.75)
+
+        # 🔧 ADJUSTMENT CONTROLS
+        name_x_offset = -155  # (-) left | (+) right
+        name_y_offset = 550     # (-) up   | (+) down
+
+        addr_x_offset = -160 # (-) left | (+) right
+        addr_y_offset = 5   # (-) up   | (+) down
+
+        # -------- Center Name --------
+        center_name_x = get_centered_x(
+            center_name.upper(),
+            font_regular,
+            center_box_start_x,
+            center_box_end_x
+        ) + name_x_offset
+
+        center_name_y = int(height * 0.02) + name_y_offset
+
+        draw.text(
+            (center_name_x, center_name_y),
+            center_name.upper(),
+            fill=text_color,
+            font=font_regular
+        )
+
+# -------- Center Address --------
+        if center_address:
+            center_addr_x = get_centered_x(
+                center_address.upper(),
+                font_small,
+                center_box_start_x,
+                center_box_end_x
+            ) + addr_x_offset
+
+            center_addr_y = int(height * 0.375) + addr_y_offset
+
+            draw.text(
+                (center_addr_x, center_addr_y),
+                center_address.upper(),
+                fill=text_color,
+                font=font_small
+            )
+
+        
+        # --- Certificate Text in Center (Bold Format) ---
+        # Get student details
+        student_name = cert_data.get('student_name', 'STUDENT NAME')
+        father_name = cert_data.get('father_name', 'FATHER NAME')
+        
+        # Format Date of Birth
+        dob = cert_data.get('date_of_birth', '')
+        dob_formatted = 'DD/MM/YYYY'
+        if dob:
+            try:
+                if isinstance(dob, str) and 'T' in dob:
+                    dob_dt = datetime.fromisoformat(dob.replace('Z', '+00:00'))
+                    dob_formatted = dob_dt.strftime('%d/%m/%Y')
+                elif isinstance(dob, str) and '-' in dob:
+                    dob_dt = datetime.strptime(dob, '%Y-%m-%d')
+                    dob_formatted = dob_dt.strftime('%d/%m/%Y')
+                else:
+                    dob_formatted = str(dob)
+            except:
+                dob_formatted = str(dob) if dob else 'DD/MM/YYYY'
+        
+        # Registration Number
+        reg_number = cert_data.get('student_registration', cert_data.get('certificate_number', 'REG12345'))
+        
+        # Get additional certificate details
+        duration = cert_data.get('course_duration', cert_data.get('duration', 'N/A'))
+        percentage = cert_data.get('percentage', 'N/A')
+        grade = cert_data.get('grade', 'A')
+        course_name = cert_data.get('course_name', 'Computer Course')
+        start_date = cert_data.get('start_date', '')
+        issue_date = cert_data.get('issue_date', datetime.now().strftime('%d/%m/%Y'))
+        
+        # Format start date if available
+        start_date_formatted = 'N/A'
+        if start_date:
+            try:
+                if isinstance(start_date, str) and '-' in start_date:
+                    start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+                    start_date_formatted = start_dt.strftime('%d/%m/%Y')
+                else:
+                    start_date_formatted = str(start_date)
+            except:
+                start_date_formatted = str(start_date)
+        
+        # Format issue date
+        issue_date_raw = cert_data.get('issue_date')
+        if issue_date_raw:
+            try:
+                if isinstance(issue_date_raw, str):
+                    if 'T' in issue_date_raw:  # ISO format
+                        issue_dt = datetime.fromisoformat(issue_date_raw.replace('Z', '+00:00'))
+                        issue_formatted = issue_dt.strftime('%d/%m/%Y')
+                    elif '-' in issue_date_raw:  # YYYY-MM-DD format
+                        issue_dt = datetime.strptime(issue_date_raw, '%Y-%m-%d')
+                        issue_formatted = issue_dt.strftime('%d/%m/%Y')
+                    else:
+                        issue_formatted = issue_date_raw
+                else:
+                    issue_formatted = str(issue_date_raw)
+            except:
+                issue_formatted = str(issue_date_raw)
+        else:
+            issue_formatted = datetime.now().strftime('%d/%m/%Y')
+        
+        # Create the complete certificate text in the requested format
+        fresh_timestamp = datetime.now().strftime('%H:%M:%S')
+        print(f"🔥 [{fresh_timestamp}] GENERATING FRESH CERTIFICATE TEXT IN NEW FORMAT!")
+        
+        certificate_text = (
+            f"This is to certify that Mr/Mrs {student_name.upper()} "
+            f"son/daughter of Mr/Mrs {father_name.upper()} "
+            f"Date of Birth {dob_formatted} Registration No. {reg_number} "
+        )
+        print(f"📝 [{fresh_timestamp}] Fresh certificate text in new format: {certificate_text}")
+        
+        # Try to load bold font
+        try:
+            bold_font_paths = [
+                "app/fonts/Roboto-Bold.ttf",
+                "arialbd.ttf", 
+                "C:/Windows/Fonts/arialbd.ttf",
+                font_path  # fallback to regular font
+            ]
+            
+            bold_font_path = None
+            for fp in bold_font_paths:
+                if os.path.exists(fp):
+                    bold_font_path = fp
+                    break
+            
+            if bold_font_path:
+                font_bold = ImageFont.truetype(bold_font_path, 22)  # Reduced size
+            else:
+                font_bold = font_name_medium  # Use medium font as fallback
+        except:
+            font_bold = font_name_medium
+        
+        # Text wrapping for multi-line display
+        import textwrap
+        lines = textwrap.wrap(certificate_text, width=40)
+        
+        # Calculate vertical position to center the text block with better flow
+        line_height = 30  # Reduced spacing for smaller text
+        total_text_height = line_height * len(lines)
+        start_y = int(height * 0.45) - (total_text_height // 2)  # Moved lower
+        
+        # Draw each line centered and bold with BLACK color - FRESH OVERLAY
+        overlay_timestamp = datetime.now().strftime('%H:%M:%S')
+        session_id = str(hash(overlay_timestamp))[-6:]
+        print(f"📋 [Session:{session_id}] Drawing {len(lines)} lines of FRESH text in NEW FORMAT with BLACK color...")
+        for i, line in enumerate(lines):
+            # Get text width to center horizontally
+            bbox = draw.textbbox((0, 0), line, font=font_bold)
+            text_width = bbox[2] - bbox[0]
+            x = (width - text_width) // 2 - 50
+            y = start_y + i * line_height
+            
+            # Draw the text in bold with black color
+            print(f"   [Session:{session_id}] Line {i+1}: '{line}' at position ({x}, {y}) in BLACK")
+            draw.text((x, y), line, fill=text_color, font=font_bold)
+        
+        print(f"✅ [Session:{session_id}] FRESH text overlay in NEW FORMAT completed!")
+        
+        # Add additional certificate information in center layout as per image
+        
+        # Course Name - Centered below main text
+        course_name = cert_data.get('course_name', 'Computer Course')
+        course_text = f"Has Passed the Prescribed Examination With A Grade ({percentage}% Marks)" if percentage else "Has Passed the Prescribed Examination With A Grade"
+        course_bbox = draw.textbbox((0, 0), course_text, font=font_bold)
+        course_width = course_bbox[2] - course_bbox[0]
+        course_x = (width - course_width) // 2
+        course_y = start_y + (len(lines) * line_height) + 20
+        draw.text((course_x, course_y), course_text, fill=text_color, font=font_bold)
+        
+        # Course Name - Second line centered  
+        course_name_text = f"and has been Awarded the {course_name.upper()} Computer Certificate"
+        course_name_bbox = draw.textbbox((0, 0), course_name_text, font=font_bold)
+        course_name_width = course_name_bbox[2] - course_name_bbox[0]
+        course_name_x = (width - course_name_width) // 2
+        course_name_y = course_y + 30
+        draw.text((course_name_x, course_name_y), course_name_text, fill=text_color, font=font_bold)
+        
+        # Duration and Date line - Centered
+        duration_text = f"Duration {duration}, Start from {start_date_formatted} and Certificate issued on {issue_formatted}"
+        duration_bbox = draw.textbbox((0, 0), duration_text, font=font_regular)
+        duration_width = duration_bbox[2] - duration_bbox[0]
+        duration_x = (width - duration_width) // 2
+        duration_y = course_name_y + 30
+        draw.text((duration_x, duration_y), duration_text, fill=text_color, font=font_regular)
+        
+        # Certificate ID
+        cert_id = cert_data.get('certificate_number', f"CERT-{datetime.now().strftime('%Y%m%d')}-{str(ObjectId())[-6:]}")
+        cert_id_x, cert_id_y = int(width * 0.05), int(height * 0.95)
+        draw.text((cert_id_x, cert_id_y), cert_id, fill=text_color, font=font_tiny)
+        
+        # Certificate generation (no visible watermarks, only basic certificate ID)
+        
+        # Unique Certificate ID from frontend (disabled - no visible watermark)
+        # unique_cert_id = cert_data.get('unique_certificate_id', cert_id)
+        # if unique_cert_id != cert_id:
+        #     unique_id_x, unique_id_y = int(width * 0.05), int(height * 0.92)
+        #     draw.text((unique_id_x, unique_id_y), f"ID: {unique_cert_id}", fill=(100, 100, 100), font=font_tiny)
+        
+        # Verification Code (disabled - no visible watermark)
+        # verification_code = cert_data.get('verification_code', f"VER{datetime.now().strftime('%H%M%S')}")
+        # verify_x, verify_y = int(width * 0.75), int(height * 0.95)
+        # draw.text((verify_x, verify_y), f"Verify: {verification_code}", fill=(100, 100, 100), font=font_tiny)
+        
+        # Generation Timestamp Watermark (disabled - no visible watermark)
+        # cert_watermark = cert_data.get('certificate_watermark', f"Generated: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        # watermark_x, watermark_y = int(width * 0.05), int(height * 0.89)
+        # draw.text((watermark_x, watermark_y), cert_watermark, fill=(150, 150, 150), font=font_tiny)
+        
+        # Certificate Serial Number (disabled - no visible watermark)
+        # cert_serial = cert_data.get('certificate_serial', f"SER{datetime.now().strftime('%Y%m%d%H%M%S')}")
+        # serial_x, serial_y = int(width * 0.75), int(height * 0.92)
+        # draw.text((serial_x, serial_y), f"Serial: {cert_serial}", fill=(100, 100, 100), font=font_tiny)
+        
+        # Generation Sequence Number (disabled - no visible watermark)
+        # gen_sequence = cert_data.get('generation_sequence', f"SEQ-{datetime.now().strftime('%Y%m%d%H%M%S')}")
+        # seq_x, seq_y = int(width * 0.75), int(height * 0.89)
+        # draw.text((seq_x, seq_y), gen_sequence, fill=(150, 150, 150), font=font_tiny)
+        
+        # Nano ID watermark (disabled - no visible watermark)
+        # nano_id = cert_data.get('nano_id', '')
+        # if nano_id:
+        #     nano_x, nano_y = int(width * 0.05), int(height * 0.86)
+        #     draw.text((nano_x, nano_y), f"Ref: {nano_id[:12]}", fill=(120, 120, 120), font=font_tiny)
+        
+        # Issue timestamp (disabled - no visible watermark)
+        # issue_timestamp = cert_data.get('issue_timestamp', int(datetime.now().timestamp() * 1000))
+        # timestamp_x, timestamp_y = int(width * 0.45), int(height * 0.95)
+        # draw.text((timestamp_x, timestamp_y), f"TS: {issue_timestamp}", fill=(130, 130, 130), font=font_tiny)
+        
+        # Unique Batch ID (disabled - no visible watermark)
+        # batch_id = cert_data.get('unique_batch_id', f"BATCH-{datetime.now().strftime('%Y%m%d')}")
+        # batch_x, batch_y = int(width * 0.45), int(height * 0.92)
+        # draw.text((batch_x, batch_y), f"Batch: {batch_id[:12]}", fill=(120, 120, 120), font=font_tiny)
+        
+        # Generation Note (disabled - no visible watermark)
+        # gen_note = cert_data.get('generation_note', f"Generated: {datetime.now().strftime('%Y-%m-%d')}")
+        # if len(gen_note) > 0:
+        #     note_x, note_y = int(width * 0.45), int(height * 0.89)
+        #     # Truncate note if too long
+        #     display_note = gen_note[:30] + "..." if len(gen_note) > 30 else gen_note
+        #     draw.text((note_x, note_y), display_note, fill=(140, 140, 140), font=font_tiny)
+        
+        # Additional unique timestamp in corner (disabled - no visible watermark)
+        # corner_timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]  # Include milliseconds
+        # corner_x, corner_y = int(width * 0.90), int(height * 0.86)
+        # draw.text((corner_x, corner_y), corner_timestamp, fill=(160, 160, 160), font=font_tiny)
+        
+        print(f"✅ [Session:{unique_session_id}] Certificate generated with ID: {cert_id}")
+        
+        # Student Photo (try all possible fields, log if missing)
+        photo_url = cert_data.get('photo_url') or cert_data.get('student_photo') or cert_data.get('photo')
+        
+        if photo_url:
+            try:
+                # Try absolute and relative paths
+                possible_paths = [
+                    photo_url,
+                    photo_url.lstrip('/'),
+                    os.path.join(BASE_DIR, photo_url.lstrip('/'))
+                ]
+
+                found = False
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        student_photo = Image.open(path).convert("RGB")
+                        student_photo = student_photo.resize((120, 140), Image.Resampling.LANCZOS)
+
+                        # Position (LEFT SHIFT APPLIED)
+                        photo_x = int(width * 0.87) - 220   # ← image left laayi gayi
+                        photo_y = int(height * 0.32)
+
+                        img.paste(student_photo, (photo_x, photo_y))
+                        print(f"Added student photo at ({photo_x}, {photo_y}) from {path}")
+
+                        found = True
+                        break
+
+                if not found:
+                    print(f"Student photo not found at any path: {possible_paths}")
+
+            except Exception as e:
+                print(f"Error loading student photo: {e}")
+
+        # ======================================
+        # GUARANTEED CERTIFICATE SAVE - NEVER FAIL
+        # ======================================
+        # Ensure output directory exists
+        base_dir = os.path.dirname(output_path)
+        os.makedirs(base_dir, exist_ok=True)
+        
+        # Generate unique filename for tracking
+        unique_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        session_id = str(hash(unique_timestamp))[-6:]
+        
+        # Log the exact output path for debugging
+        print(f"📁 [Session:{session_id}] SAVING CERTIFICATE TO: {output_path}")
+        print(f"📁 [Session:{session_id}] DIRECTORY: {os.path.dirname(output_path)}")
+        
+        # FORCE SAVE - NEVER FAIL
+        img.save(output_path, "PNG", quality=100, optimize=True)
+        print(f"✅ [Session:{session_id}] CERTIFICATE SAVED: {output_path}")
+        
+        # STRICT VERIFICATION - File MUST exist and be accessible
+        if not os.path.exists(output_path):
+            raise Exception(f"Certificate file was not created: {output_path}")
+            
+        file_size = os.path.getsize(output_path)
+        if file_size == 0:
+            raise Exception(f"Certificate file is empty: {output_path}")
+            
+        print(f"🎉 [Session:{session_id}] CERTIFICATE VERIFIED: {file_size} bytes")
+        print(f"📄 [Session:{session_id}] CERTIFICATE SAVED AT: {output_path}")
+        
+        return True
+            
+    except Exception as save_error:
+        print(f"❌ Certificate generation failed: {save_error}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate certificate: {str(save_error)}")
+    
+
+
